@@ -1,0 +1,4 @@
+NAME              CLUSTER                         NAMESPACE  PROJECT  STATUS  HEALTH   SYNCPOLICY  CONDITIONS  REPO                                                           PATH         TARGET
+argocd/guestbook  https://kubernetes.default.svc  guestbook  default  Synced  Healthy  Auto-Prune  <none>      https://github.com/argoproj/argocd-example-apps.git            guestbook    HEAD
+argocd/root       https://kubernetes.default.svc  argocd     default  Synced  Healthy  Auto-Prune  <none>      https://github.com/SAVE-IT-DATA-TECHNOLOGY/homelab-gitops.git  argocd/apps  main
+argocd/whoami     https://kubernetes.default.svc  whoami     default  Synced  Healthy  Auto-Prune  <none>      https://github.com/SAVE-IT-DATA-TECHNOLOGY/homelab-gitops.git  apps/whoami  main

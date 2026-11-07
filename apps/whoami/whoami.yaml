@@ -41,6 +41,9 @@ metadata:
     traefik.ingress.kubernetes.io/router.tls: "true"
 spec:
   ingressClassName: traefik
+  tls:                        # no secretName: Traefik keeps its default cert; Argo CD now links to https://
+    - hosts:
+        - whoami.home.lab
   rules:
     - host: whoami.home.lab
       http:
