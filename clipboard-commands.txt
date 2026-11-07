@@ -1,0 +1,33 @@
+Option 1: SSH from Windows (recommended for a CLI-only VM)
+
+Copy and paste work both ways, using normal Windows shortcuts.
+
+1. Inside Kali, turn on SSH:
+
+bash
+sudo apt install -y openssh-server
+sudo systemctl enable --now ssh
+
+2. In VirtualBox, forward a port. With the VM selected: Settings → Network → Adapter 1 (NAT) → Advanced → Port Forwarding → +
+
+Name	Protocol	Host IP	Host Port	Guest IP	Guest Port
+ssh	TCP	127.0.0.1	2222	(blank)	22
+
+Click OK. This works while the VM is running.
+
+3. Connect from Windows PowerShell or CMD:
+
+powershell
+ssh -p 2222 kali@127.0.0.1
+
+If it stops with "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED ... Host key verification failed",
+the VM was reinstalled and has new host keys. Forget the old key, then connect again:
+
+powershell
+ssh-keygen -R "[127.0.0.1]:2222"
+ssh -p 2222 kali@127.0.0.1
+
+Enter the password (default is kali). You now have the Kali shell inside a Windows window:
+
+Paste into the VM: Ctrl+V or right-click
+Copy from the VM: select the text with the mouse, then Ctrl+C or right-click
