@@ -1754,7 +1754,7 @@ argocd app list                                   # root + whoami -> Synced / He
 kubectl -n whoami get pods -o wide                # 3 pods spread over the agents
 
 # load-balanced across pods/agents: Hostname changes between calls
-1..6 | ForEach-Object { (curl.exe -sk https://whoami.home.lab) -match '^Hostname' }
+1..6 | ForEach-Object { (curl.exe -sk https://whoami.home.lab/whoami) -match '^Hostname' }
 ```
 
 **See GitOps work:**

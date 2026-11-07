@@ -38,6 +38,17 @@
     .card span { font-size: .9rem; color: var(--muted); }
     footer { padding: 16px; text-align: center; font-size: .85rem; color: var(--muted); }
     code { font-family: ui-monospace, Consolas, monospace; font-size: .9em; }
+    table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    tr:last-child td { border-bottom: 0; }
+    th { font-size: .85rem; color: var(--muted); font-weight: 600; }
+    td a { color: var(--accent); word-break: break-all; }
+    h3 { font-size: .95rem; margin: 20px 0 8px; }
+    pre {
+      margin: 0; padding: 12px 14px; overflow-x: auto; background: var(--card);
+      border: 1px solid var(--border); border-radius: 10px; line-height: 1.6;
+    }
+    .c { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -45,16 +56,27 @@
     <h1>home.lab</h1>
     <p class="sub">K3s HA cluster · managed by Argo CD from <code>homelab-gitops</code></p>
 
-    <h2>Services</h2>
-    <div class="grid">
-      <a class="card" href="https://argocd.home.lab"><strong>Argo CD</strong><span>GitOps deployments</span></a>
-      <a class="card" href="https://whoami.home.lab"><strong>whoami</strong><span>Request echo / load-balancing test</span></a>
-    </div>
+    <h2>URIs</h2>
+    <table>
+      <tr><th>URI</th><th>What it is</th></tr>
+      <tr><td><a href="https://whoami.home.lab/">https://whoami.home.lab/</a></td><td>This home page (nginx, Argo CD app <code>whoami</code>)</td></tr>
+      <tr><td><a href="https://whoami.home.lab/whoami">https://whoami.home.lab/whoami</a></td><td>whoami echo: shows which pod answered</td></tr>
+      <tr><td><a href="https://argocd.home.lab">https://argocd.home.lab</a></td><td>Argo CD UI</td></tr>
+      <tr><td><a href="https://github.com/SAVE-IT-DATA-TECHNOLOGY/homelab-gitops">github.com/SAVE-IT-DATA-TECHNOLOGY/homelab-gitops</a></td><td>Git source. This page is <code>apps/whoami/index.html</code></td></tr>
+    </table>
 
-    <h2>Source</h2>
-    <div class="grid">
-      <a class="card" href="https://github.com/SAVE-IT-DATA-TECHNOLOGY/homelab-gitops"><strong>homelab-gitops</strong><span>Edit <code>apps/home/index.html</code> to change this page</span></a>
-    </div>
+    <h2>Commands</h2>
+    <h3>Update this page</h3>
+<pre><code>git add apps/whoami/index.html
+git commit -m "update home page"
+git push
+argocd app get whoami --refresh     <span class="c"># or REFRESH in the Argo CD UI</span></code></pre>
+
+    <h3>Check it</h3>
+<pre><code>argocd app get whoami
+kubectl -n whoami get pods,svc,ingress
+curl.exe -sk https://whoami.home.lab/ | Select-String '&lt;title&gt;'
+1..6 | ForEach-Object { (curl.exe -sk https://whoami.home.lab/whoami) -match '^Hostname' }</code></pre>
   </main>
   <footer>Served by nginx on K3sssssssss</footer>
 </body>
