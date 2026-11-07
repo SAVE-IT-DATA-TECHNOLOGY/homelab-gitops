@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/Saveit29/homelab-gitops.git
+    repoURL: https://github.com/SAVE-IT-DATA-TECHNOLOGY/homelab-gitops.git
     targetRevision: main
     path: apps/whoami
   destination:
