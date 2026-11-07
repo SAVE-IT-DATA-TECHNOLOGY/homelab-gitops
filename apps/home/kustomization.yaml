@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - home.yaml
+configMapGenerator:
+  # Builds a ConfigMap from index.html. Its name gets a content hash,
+  # so editing index.html rolls the pods automatically on sync.
+  - name: home-html
+    files:
+      - index.html
