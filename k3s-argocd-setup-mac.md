@@ -51,7 +51,7 @@
 14. [Mac: install Argo CD](#step-14--mac-install-argo-cd)
 15. [Mac: expose Argo CD through Traefik](#step-15--mac-expose-argo-cd-through-traefik)
 16. [Mac: Argo CD CLI login and admin password](#step-16--mac-argo-cd-cli-login-and-admin-password)
-17. [Mac: first Argo CD app (podinfo)](#step-17--mac-first-argo-cd-app-podinfo)
+17. [Mac: first Argo CD app (podinfo, rendered from its public Helm chart)](#step-17--mac-first-argo-cd-app-podinfo-rendered-from-its-public-helm-chart)
 18. [Mac and GitHub: your own GitOps repo (app-of-apps)](#step-18--mac-and-github-your-own-gitops-repo-app-of-apps)
 19. [Day-2: start/stop, backups, upgrades](#step-19--day-2-startstop-backups-upgrades)
 - [Appendix A: embedded etcd variant (no external DB)](#appendix-a--variant-embedded-etcd-no-external-db)
@@ -650,6 +650,9 @@ You install Kali into `kali-template` with the **Xfce desktop (GUI)** and the `k
   VBoxManage modifyvm $VM --clipboard-mode bidirectional --drag-and-drop bidirectional                      # shared clipboard for the desktops (Step 4 part 3b)
   VBoxManage modifyvm $VM --nic1 nat --nic2 hostonlynet --host-only-net2 $HON
   VBoxManage modifyvm $VM --natpf1 "ssh,tcp,127.0.0.1,2222,,22"      # NAT port forward: Mac 127.0.0.1:2222 -> template port 22 (Step 4)
+  # the Guest Additions (Step 4 part 3b) keep the VM on the Mac's clock: step it whenever it is >1 s off, and at every boot
+  VBoxManage guestproperty set $VM "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold" 1000
+  VBoxManage guestproperty set $VM "/VirtualBox/GuestAdd/VBoxService/--timesync-set-start" 1
   VBoxManage modifyvm $VM --boot1 disk --boot2 dvd --boot3 none --boot4 none
   VBoxManage createmedium disk --filename "$VDI" --size 25600 --format VDI
   VBoxManage storagectl $VM --name $VBOX_CTL --portcount 2
@@ -814,14 +817,18 @@ sudo visudo -cqf /tmp/91-secure-path && sudo install -m 440 /tmp/91-secure-path 
 sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade
 sudo apt install -y curl wget vim jq netcat-openbsd openssl cron apparmor systemd-timesyncd
 
-# 3) timezone + time sync (TLS and datastores hate clock skew)
+# 3) timezone + time sync (TLS and datastores hate clock skew). NTP keeps the time until part 3b;
+#    from then on the VirtualBox Guest Additions keep every VM on the Mac's clock instead (see 3b)
 sudo timedatectl set-timezone UTC          # or your zone, e.g. Europe/Berlin
 sudo timedatectl set-ntp true
 timedatectl status | grep -E 'synchronized|NTP service'
 
-# 4) disable swap (recommended for Kubernetes nodes; the Kali installer creates a swap partition)
-sudo swapoff -a
-sudo sed -i '/\sswap\s/ s/^/#/' /etc/fstab
+# 4) swap stays ON, on purpose. The kubelet in K3s runs with swap on and gives every container memory.swap.max=0
+#    (Kubernetes' default NoSwap behaviour), so pods never swap. What does page out is the idle Xfce desktop,
+#    which leaves that RAM to K3s on these 2 GB VMs. Commenting the swap line out of /etc/fstab would not turn it
+#    off anyway: on an EFI/GPT disk, systemd activates the swap partition by its partition type.
+#    To turn it off for good (e.g. with 4 GB per VM), see the Appendix C row "Swap is active".
+swapon --show
 
 # 5) keep NetworkManager away from the interfaces K3s / flannel create
 sudo tee /etc/NetworkManager/conf.d/90-k3s.conf >/dev/null <<'EOF'
@@ -833,7 +840,7 @@ EOF
 sudo sed -i '/^# BEGIN home.lab/,/^# END home.lab/d' /etc/hosts
 sudo tee -a /etc/hosts >/dev/null <<'EOF'
 # BEGIN home.lab
-192.168.99.10  k3s-lb.home.lab k3s-lb k3s.home.lab argocd.home.lab whoami.home.lab
+192.168.99.10  k3s-lb.home.lab k3s-lb k3s.home.lab argocd.home.lab whoami.home.lab podinfo.home.lab
 192.168.99.11  k3s-db.home.lab k3s-db
 192.168.99.21  k3s-srv-1.home.lab k3s-srv-1
 192.168.99.22  k3s-srv-2.home.lab k3s-srv-2
@@ -943,6 +950,8 @@ ssh kali-template
 sudo mount -o ro /dev/sr0 /mnt
 sudo sh /mnt/VBoxLinuxAdditions-arm64.run
 sudo umount /mnt
+# the Guest Additions keep the clock from now on (see below): NTP off, so nothing starts it by accident
+sudo systemctl disable --now systemd-timesyncd
 sudo reboot
 ```
 
@@ -954,6 +963,12 @@ ssh kali-template
 ```
 
 The template's desktop now follows its window size (*View → Auto-resize Guest Display*). When Kali later installs a new kernel, the Guest Additions rebuild their modules for it, as long as `linux-headers-arm64` stays installed.
+
+> **The Guest Additions now keep the clock, not NTP.**
+> - **Why NTP stops:** their service, `vboxadd-service`, declares `Conflicts=systemd-timesyncd.service`. Starting either one stops the other, so from here on `timedatectl` shows *NTP service: inactive* and *System clock synchronized: no*. That is expected.
+> - **What keeps time instead:** `VBoxService` sets each VM to the Mac's clock, which macOS keeps on NTP. The two guest properties from Step 3 make it step the clock at boot and whenever it is more than 1 s off.
+> - **Without them,** VBoxService only steps the clock when it is **20 minutes** off, and slews anything smaller at about 0.5 ms per second. A VM that boots 12 s behind then stays behind for hours, and the nodes drift apart.
+> - **After the Mac sleeps:** if a VM comes back behind, VBoxService corrects it at its next check, which runs every 10 seconds.
 
 4. **Run on:** `kali-template`, same SSH session (to reconnect: `ssh -p 2222 kali@127.0.0.1`). Before you clone the template, check that it has everything `set-identity` needs. Every line must say **`OK`**:
 
@@ -973,6 +988,7 @@ chk "eth1 on the host-only network"    'ip -4 -br addr show eth1 | grep -q " 192
 chk "Mac SSH key authorized"           'grep -qE "^(ssh|ecdsa|sk)-" ~/.ssh/authorized_keys'
 chk "Xfce desktop (graphical boot)"    '[ "$(systemctl get-default)" = graphical.target ] && systemctl is-active --quiet lightdm'
 chk "Guest Additions (Apple Silicon)"  '[ "$(dpkg --print-architecture)" != arm64 ] || lsmod | grep -q "^vboxguest"'
+chk "Clock follows the Mac (>1 s)"     'pgrep -x VBoxService >/dev/null && [ "$(sudo VBoxControl --nologo guestproperty get /VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold)" = "Value: 1000" ]'
 ```
 
 Here is what `set-identity` uses, and which command above provides it:
@@ -991,9 +1007,10 @@ Here is what `set-identity` uses, and which command above provides it:
 | Adapter 2 = host-only network, so `eth1` reaches `192.168.99.0/24` | Step 3 (`--nic2 hostonlynet --host-only-net2 k3s-hostonly`), copied by every clone | on the Mac, `VBoxManage showvminfo kali-template --machinereadable \| grep -E '^(nic2\|hostonly-network2)='` must print `nic2="hostonlynetwork"` and `hostonly-network2="k3s-hostonly"`; check Step 2, then `sudo reboot` in the VM |
 | your Mac's SSH key in `~/.ssh/authorized_keys`, which every clone inherits (the Step 6 check, Step 6 option B, and every later `ssh <vm>`) | part 2: the `ssh-copy-id … kali-template` line | Run that line again on the Mac and enter the `kali` password. Then the part 2 check line must print `SSH key login: OK` |
 
-`set-identity` doesn't need the last two check lines, but every clone inherits what they test:
+`set-identity` doesn't need the last three check lines, but every clone inherits what they test:
 - ***Xfce desktop*** `MISSING`: Xfce was not ticked in Step 3. See the Appendix C row *A VM boots to a text login*.
 - ***Guest Additions*** `MISSING`: run part 3b.
+- ***Clock follows the Mac*** `MISSING`: the template was created before Step 3 set the two time-sync guest properties. Run the two `VBoxManage guestproperty set …` lines from Step 3 on the Mac, with `$VM` replaced by `kali-template` (the VM can keep running). Then run `sudo systemctl restart vboxadd-service` in the template, and check again. If `VBoxService` isn't running, run part 3b.
 
 5. When every line says `OK`, clean up and power off. The template is never booted again, unless you have to fix it:
 
@@ -1059,6 +1076,9 @@ Then:
     # replace the inherited 127.0.0.1:2222 rule (kali-template's) with this clone's own port
     VBoxManage modifyvm "$n" --natpf1 delete ssh 2>/dev/null
     VBoxManage modifyvm "$n" --natpf1 "ssh,tcp,127.0.0.1,$port,,22"
+    # keep this clone on the Mac's clock (Step 3, Step 4 part 3b); set per clone, so it holds whatever clonevm copies
+    VBoxManage guestproperty set "$n" "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold" 1000
+    VBoxManage guestproperty set "$n" "/VirtualBox/GuestAdd/VBoxService/--timesync-set-start" 1
     VBoxManage startvm "$n" --type gui
   done
   for row in $K3S_NODES; do read -r n cpus mem ip port <<< "$row"; printf '%-12s ssh -p %s kali@127.0.0.1\n' "$n" "$port"; done
@@ -1590,6 +1610,46 @@ k3s-srv-1     Ready    control-plane   192.168.99.21
 k3s-srv-2     Ready    control-plane   192.168.99.22
 ```
 
+**Still on `k3s-srv-1`: keep ingress and DNS up when a server goes down.** The servers' `CriticalAddonsOnly` taint keeps apps off them, but two K3s add-ons tolerate it, and K3s runs each as a **single replica**:
+- **Traefik**, the ingress controller. When it runs on `k3s-srv-1` and that server goes off, every `https://….home.lab` page (the Argo CD UI included) is down for about 5 minutes, until Kubernetes moves Traefik.
+- **CoreDNS**, the cluster DNS. For the same 5 minutes every pod loses DNS. Argo CD can't reach GitHub, and apps can't find each other by name.
+
+This block:
+- runs **Traefik twice, only on the agents**, one per agent, with a PodDisruptionBudget so that a drain never takes both away. A `HelmChartConfig` is K3s's supported way to change the values of its bundled Traefik chart.
+- runs **CoreDNS twice**. K3s's CoreDNS manifest already spreads its replicas over different nodes, and it sets no replica count, so the scale survives K3s restarts and upgrades.
+
+```bash
+sudo k3s kubectl apply -f - <<'EOF'
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    deployment:
+      replicas: 2
+    nodeSelector:
+      node-role.kubernetes.io/worker: worker
+    topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+            app.kubernetes.io/instance: traefik-kube-system
+        maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+EOF
+sudo k3s kubectl -n kube-system scale deployment coredns --replicas=2
+# K3s re-runs its Traefik install job with the new values; wait until both new replicas are ready
+until sudo k3s kubectl -n kube-system get deployment traefik -o jsonpath='{.spec.replicas}/{.status.updatedReplicas}/{.status.readyReplicas}' | grep -qx 2/2/2; do sleep 5; done
+sudo k3s kubectl -n kube-system get pods -o wide -l app.kubernetes.io/name=traefik   # 2 pods, on 2 different agents
+sudo k3s kubectl -n kube-system get pods -o wide -l k8s-app=kube-dns                 # 2 pods, on 2 different nodes
+```
+
 Still on `k3s-srv-1`, prepare a kubeconfig copy for the Mac:
 
 ```bash
@@ -1630,7 +1690,9 @@ kubectl cluster-info          # Kubernetes control plane is running at https://1
 ```zsh
 # 1) kill server #1 hard
 VBoxManage controlvm k3s-srv-1 poweroff
-kubectl get nodes                 # still answers (NGINX -> k3s-srv-2); srv-1 turns NotReady after ~40 s
+kubectl get nodes                 # still answers (NGINX -> k3s-srv-2); srv-1 turns NotReady after ~40-60 s
+curl -sk -o /dev/null -w '%{http_code}\n' https://192.168.99.10/     # 404 = Traefik answered (no app on / yet); 000 or 502 = ingress down
+kubectl -n kube-system get pods -o wide -l k8s-app=kube-dns          # the CoreDNS on k3s-srv-2 still serves the cluster
 
 # 2) bring it back, then kill server #2
 VBoxManage startvm k3s-srv-1 --type gui
@@ -1639,6 +1701,8 @@ VBoxManage controlvm k3s-srv-2 poweroff
 kubectl get nodes                 # still answers via k3s-srv-1
 VBoxManage startvm k3s-srv-2 --type gui
 ```
+
+> **Run it again after Step 17.** While a server is off, `https://argocd.home.lab` and `https://podinfo.home.lab` must keep answering `200`. If they go down for minutes, Traefik or CoreDNS is still a single replica on that server: run the last `k3s-srv-1` block of Step 11.
 
 > **Single points of failure in the video's design:** `k3s-db` and `k3s-lb`. If either one is down, the API is down (running pods keep running). Appendix A removes the DB from the picture (embedded etcd); Appendix B makes the LB redundant (keepalived VIP).
 
@@ -1717,15 +1781,20 @@ kubectl -n argocd get ingress
 **Run on:** Mac. Add the DNS names to the Mac's `/etc/hosts` (`sudo` asks for your Mac password), then flush the macOS DNS cache:
 
 ```zsh
-grep -q 'argocd\.home\.lab' /etc/hosts || printf '\n192.168.99.10  k3s.home.lab argocd.home.lab whoami.home.lab\n' | sudo tee -a /etc/hosts >/dev/null
+grep -q 'argocd\.home\.lab' /etc/hosts || printf '\n192.168.99.10  k3s.home.lab argocd.home.lab whoami.home.lab podinfo.home.lab\n' | sudo tee -a /etc/hosts >/dev/null
 sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 ```
 
 Test it:
 
 ```zsh
-curl -skI https://argocd.home.lab | head -1      # HTTP/2 200  (or HTTP/1.1 200 OK)
+dscacheutil -q host -a name argocd.home.lab | grep address    # ip_address: 192.168.99.10
+curl -skI https://argocd.home.lab | head -1                    # HTTP/2 200  (or HTTP/1.1 200 OK)
 ```
+
+> **No address, or curl prints nothing?** The `/etc/hosts` line is missing, so the Mac can't find `argocd.home.lab`. Run the block above again and enter your Mac password when `sudo` asks.
+> - Don't work around it with `argocd login --port-forward`. The CLI then saves a server called `port-forward`, and every later `argocd` command fails with *lookup port-forward: no such host* (Appendix C).
+> - Meanwhile, `curl --resolve argocd.home.lab:443:192.168.99.10 -skI https://argocd.home.lab` tests the route without the hosts line.
 
 Open **<https://argocd.home.lab>** and accept the self-signed certificate.
 - **Safari:** *Show Details → visit this website*.
@@ -1752,20 +1821,38 @@ argocd cluster list       # https://kubernetes.default.svc   in-cluster   Succes
 
 - `--grpc-web` makes the CLI work through Traefik over HTTP/1.1.
 - `--insecure` is needed because of the self-signed certificate.
+- `argocd context` lists the servers the CLI knows, with `*` at the current one. It must be `argocd.home.lab`. If it is `port-forward`, run the `argocd login argocd.home.lab …` line again.
 
 The web UI uses the same login: user `admin` and your new password.
 
 ---
 
-## Step 17 — Mac: first Argo CD app (podinfo)
+## Step 17 — Mac: first Argo CD app (podinfo, rendered from its public Helm chart)
 
-This is a zero-setup sanity check from a public Git repo.
+This app comes straight from a public Git repo, so it needs no repo of your own. Argo CD:
+1. clones <https://github.com/stefanprodan/podinfo> at a release tag;
+2. **renders** the Helm chart in its `charts/podinfo` folder with the values written in the Application. Argo CD runs the chart's templates itself; you don't install `helm`;
+3. applies the result, and keeps the cluster in sync with it.
+
+What it deploys is a small two-tier web app:
+- **`podinfo`:** 2 web replicas, spread over the agents;
+- **`podinfo-redis`:** a Redis cache. The chart wires podinfo to it (`--cache-server=tcp://podinfo-redis:6379`);
+- **an Ingress**, so the app renders in your browser at **<https://podinfo.home.lab>**, through `k3s-lb` and Traefik like Argo CD itself.
+
+Both images, `ghcr.io/stefanprodan/podinfo` and `docker.io/redis`, have `arm64` builds.
 
 > **Why not the Windows guide's guestbook?** Its image, `gcr.io/google-samples/gb-frontend:v5`, is built for **amd64 only**. On Apple Silicon (arm64) nodes its pods crash with `exec format error`.
-> - **podinfo** is a small demo web app published for amd64 **and** arm64, with Kustomize manifests in its repo.
+> - **podinfo** is a small demo web app published for amd64 **and** arm64, with a Helm chart in its repo.
 > - On an Intel Mac the guestbook works too: `repoURL: https://github.com/argoproj/argocd-example-apps.git`, `path: guestbook`.
 
-**Run on:** Mac.
+**Run on:** Mac. If your `/etc/hosts` line from Step 15 is older than `podinfo.home.lab`, add the name (`sudo` asks for your Mac password):
+
+```zsh
+grep -q 'podinfo\.home\.lab' /etc/hosts || printf '192.168.99.10  podinfo.home.lab\n' | sudo tee -a /etc/hosts >/dev/null
+sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+```
+
+**Run on:** Mac. Create the Application:
 
 ```zsh
 kubectl apply -f - <<'EOF'
@@ -1774,12 +1861,46 @@ kind: Application
 metadata:
   name: podinfo
   namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io/background   # deleting the app also deletes what it deployed
 spec:
   project: default
   source:
-    repoURL: https://github.com/stefanprodan/podinfo.git
-    targetRevision: HEAD
-    path: kustomize
+    repoURL: https://github.com/stefanprodan/podinfo.git    # public repo
+    targetRevision: 6.17.0                                   # a release tag, not HEAD: the same chart on every sync
+    path: charts/podinfo                                     # a Helm chart: Argo CD renders it with the values below
+    helm:
+      releaseName: podinfo
+      valuesObject:
+        replicaCount: 2
+        ui:
+          message: "Rendered by Argo CD from github.com/stefanprodan/podinfo"
+        redis:
+          enabled: true          # second tier: a Redis cache that podinfo is wired to (--cache-server)
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+          limits: { memory: 128Mi }
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: podinfo
+        ingress:
+          enabled: true
+          className: traefik
+          annotations:
+            traefik.ingress.kubernetes.io/router.entrypoints: websecure
+            traefik.ingress.kubernetes.io/router.tls: "true"
+          hosts:
+            - host: podinfo.home.lab
+              paths:
+                - path: /
+                  pathType: Prefix
+          tls:
+            - hosts:
+                - podinfo.home.lab
   destination:
     server: https://kubernetes.default.svc
     namespace: podinfo
@@ -1792,17 +1913,40 @@ spec:
 EOF
 
 argocd app wait podinfo --health --timeout 300
-argocd app get podinfo                    # Sync Status: Synced, Health: Healthy
-kubectl -n podinfo get pods -o wide       # 2 pods on the agents (its HPA scales 2-4)
+argocd app get podinfo                          # Sync Status: Synced to 6.17.0, Health Status: Healthy
+kubectl -n podinfo get pods,ingress -o wide     # 2 podinfo pods on 2 agents, 1 podinfo-redis, ingress podinfo.home.lab
 ```
 
-To see it, run this and open <http://localhost:9898> (it shows the pod name), then press Ctrl+C:
+> **Replacing the Kustomize podinfo of an earlier version of this guide?** That one used `path: kustomize`. Its Deployment has a different label selector, and Kubernetes doesn't allow a selector to change, so the sync fails with *field is immutable*. Delete it first, together with what it deployed: `argocd app delete podinfo --yes`. Then apply the block above.
+
+**Open <https://podinfo.home.lab>** and accept the self-signed certificate, as in Step 15.
+- The page shows the message from the Application's values, and the name of the pod that served it.
+- Reload it a few times: the name switches between the two replicas.
+
+Or test it from Terminal:
 
 ```zsh
-kubectl -n podinfo port-forward svc/podinfo 9898:9898
+for i in 1 2 3 4; do curl -sk https://podinfo.home.lab/api/info | grep -E '"(hostname|message)"'; done   # both pod names, and the message from the values
+curl -sk -X POST -d 'hello from the Mac' https://podinfo.home.lab/cache/demo    # stored in Redis by whichever pod answers...
+curl -sk https://podinfo.home.lab/cache/demo; echo                             # ...and read back through either pod
 ```
 
-Clean up when you're done: `argocd app delete podinfo --yes`.
+**See Argo CD render a change.** Change two values in the Application. Argo CD renders the chart again, finds that only the Deployment changed, and rolls out new pods:
+
+```zsh
+kubectl -n argocd patch application podinfo --type merge -p '{"spec":{"source":{"helm":{"valuesObject":{"ui":{"color":"#2e7d32","message":"Re-rendered by Argo CD after a values change"}}}}}}'
+argocd app manifests podinfo | grep -A1 -E 'PODINFO_UI_(COLOR|MESSAGE)'    # the rendered Deployment now carries the new values
+```
+
+Reload the page: within seconds it is green, with the new message. To go back, set the values back the same way. `null` removes a value, so the chart's default color returns:
+
+```zsh
+kubectl -n argocd patch application podinfo --type merge -p '{"spec":{"source":{"helm":{"valuesObject":{"ui":{"color":null,"message":"Rendered by Argo CD from github.com/stefanprodan/podinfo"}}}}}}'
+```
+
+- **A newer podinfo:** change `targetRevision` to another release tag from <https://github.com/stefanprodan/podinfo/releases>.
+- **Into Git:** to manage this app from your own repo like `whoami` (Step 18), save the Application above as `argocd/apps/podinfo.yaml` there, and push. The `root` app then takes it over, without redeploying podinfo.
+- **Clean up:** `argocd app delete podinfo --yes`, or `kubectl -n argocd delete application podinfo`. The finalizer makes either one delete the pods, services and ingress too.
 
 ---
 
@@ -2019,21 +2163,36 @@ argocd repo add "https://github.com/$GH_USER/homelab-gitops.git" --username "$GH
 **Run on:** Mac.
 
 ```zsh
-# START: datastore -> LB -> servers -> agents, each in its own window with its desktop (--type headless = no window)
+# START: datastore -> LB -> servers -> agents, each in its own window with its desktop (--type headless = no window).
+# Each VM must answer SSH before the next one starts: MariaDB is up before the servers, the servers before the agents
 for vm in k3s-db k3s-lb k3s-srv-1 k3s-srv-2 k3s-agent-1 k3s-agent-2 k3s-agent-3; do
   VBoxManage startvm $vm --type gui
-  sleep 15
+  for i in {1..60}; do ssh -n -o ConnectTimeout=3 -o BatchMode=yes $vm true 2>/dev/null && break; sleep 3; done
 done
-VBoxManage startvm kali --type gui           # Kali Xfce desktop (Appendix E): opens in its own window
+VBoxManage list vms | grep -q '^"kali" ' && VBoxManage startvm kali --type gui    # Kali Xfce desktop (Appendix E), if you built it
 
-# STOP (clean shutdown over SSH, reverse order; the power button if SSH doesn't answer)
-ssh -n -o ConnectTimeout=5 kali "sudo poweroff"
+# STOP (clean shutdown over SSH, reverse order; the power button if SSH doesn't answer), then wait until all are off
+ssh -n -o ConnectTimeout=5 kali "sudo poweroff" 2>/dev/null
 for vm in k3s-agent-3 k3s-agent-2 k3s-agent-1 k3s-srv-2 k3s-srv-1 k3s-lb k3s-db; do
   ssh -n -o ConnectTimeout=5 $vm "sudo poweroff" || VBoxManage controlvm $vm acpipowerbutton
 done
+until ! VBoxManage list runningvms | grep -qE '^"(k3s-|kali")'; do sleep 3; done; print "lab stopped"
 ```
 
-> The VMs pause while the Mac sleeps. After a long sleep their clocks can lag behind: see *Errors after the Mac slept* in Appendix C. For a long break, stop the lab first.
+After a START, check that everything came back. This takes 2–3 minutes after the last agent:
+
+```zsh
+kubectl get nodes                                    # 5 x Ready
+kubectl get pods -A | grep -vE 'Running|Completed'   # only the header line is left
+kubectl -n argocd get applications                   # every app Synced / Healthy
+```
+
+> **Stop the lab before the Mac restarts, shuts down or installs a macOS update.**
+> - **What happens otherwise:** macOS doesn't wait for VirtualBox. A restart, a shutdown, or the restart that Software Update does after you log out cuts the power of every running VM, and VirtualBox then lists them all as **Aborted**.
+> - **To recover**, run the START block. `VBoxManage startvm` starts an aborted VM like any other. MariaDB replays its log, K3s and the pods restart, and every Argo CD app returns to *Synced / Healthy*.
+> - **During the first minutes**, a pod can sit in `CrashLoopBackOff` or `ImagePullBackOff` until what it depends on is up again, for example a registry that itself runs in the cluster. It recovers by itself.
+>
+> **While the Mac sleeps, the VMs pause.** When it wakes, the Guest Additions put each VM's clock back on the Mac's (Step 4 part 3b). For a long break, stop the lab anyway.
 
 ### Backups
 
@@ -2203,12 +2362,16 @@ To test, power off `k3s-lb-1` (`VBoxManage controlvm k3s-lb-1 poweroff`). The VI
 | K3s logs `Error 1040: Too many connections`; MariaDB logs *Aborted connection … (Too many connections)* | Starting K3s servers open more than MariaDB's default 151 connections | `90-k3s.cnf` from Step 7 (`max_connections = 500`). To apply it without restarting under the running cluster: `sudo mariadb -e "SET GLOBAL max_connections = 500"` |
 | Agent hangs or logs `connection refused` to `192.168.99.10:6443` | NGINX not forwarding | On `k3s-lb`: `sudo nginx -t`, `sudo ss -tlnp`, `nc -zv 192.168.99.21 6443`, `tail /var/log/nginx/k3s-stream.log` |
 | `nginx: [emerg] unknown directive "stream"` | stream module missing | `sudo apt install libnginx-mod-stream`; keep the `include /etc/nginx/modules-enabled/*.conf;` line |
-| Pods **Pending** with *untolerated taint {CriticalAddonsOnly}* (`helm-install-traefik*`, `helm-install-gateway-api-crd`, later `traefik`, `svclb-*`) | no agents yet; servers are tainted by design. Only `coredns`, `metrics-server` and `local-path-provisioner` tolerate the taint and run on the servers | Finish Step 11. When `get nodes` shows only the 2 servers after Step 11, check `sudo journalctl -u k3s-agent -n 5` on an agent (next row) |
+| Pods **Pending** with *untolerated taint {CriticalAddonsOnly}* (`helm-install-traefik*`, `helm-install-gateway-api-crd`) | no agents yet; servers are tainted by design, and K3s's `helm-install` jobs don't tolerate the taint. `coredns`, `metrics-server`, `local-path-provisioner` and Traefik itself do tolerate it, so they can run on the servers | Finish Step 11. When `get nodes` shows only the 2 servers after Step 11, check `sudo journalctl -u k3s-agent -n 5` on an agent (the row *Agents stay `activating`*) |
+| While one server is off (Step 13, or a crash), every `https://….home.lab` page fails, or pods can't resolve names (Argo CD: *dial tcp: lookup github.com … i/o timeout*), for about 5 minutes | Traefik or CoreDNS runs as **one** replica on that server. Kubernetes moves a pod away from a node that stopped answering only after 5 minutes | Run the last `k3s-srv-1` block of Step 11: 2 × Traefik on the agents, 2 × CoreDNS. Check: `kubectl -n kube-system get pods -o wide -l app.kubernetes.io/name=traefik` lists two agents, and `-l k8s-app=kube-dns` two different nodes |
+| `swapon --show` lists a swap partition, although `/etc/fstab` has no swap line | On an EFI/GPT disk, `systemd-gpt-auto-generator` activates a partition of type *Linux swap* by itself. This guide keeps it on: pods can't use it (`memory.swap.max = 0`), and the idle desktop pages out instead of taking RAM from K3s (Step 4, item 4) | To turn swap off for good anyway (for example with 4 GB per VM), on each VM: `echo 'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX systemd.swap=0"' \| sudo tee /etc/default/grub.d/91-no-swap.cfg && sudo update-grub && sudo swapoff -a`. `systemd.swap=0` stops the generator; it applies from the next boot |
 | Agents stay `activating`, and `journalctl -u k3s-agent` repeats *failed to retrieve configuration from server: **not authorized*** | The agent's token isn't the cluster's token. Usually the Step 7 secrets block ran again after Step 9 and made new secrets: the cluster keeps the **first** token, and MariaDB keeps the **first** `k3s` password (`CREATE USER IF NOT EXISTS` doesn't change it). The running servers still work from memory, but they **won't start again** with the new files | Compare on a server: `sudo cat /var/lib/rancher/k3s/server/token \| sed 's/.*::server://' \| tr -d '\n' \| sha256sum` with `grep -oP '^K3S_TOKEN=\K.*' ~/k3s-secrets.env \| tr -d '\n' \| sha256sum`. If they differ, keep the cluster's **original token** with the **new DB password**. The original token is still in `/var/lib/rancher/k3s/server/token`, while the old DB password is gone. 1) `k3s-db`: `source ~/k3s-secrets.env`, then `sudo mariadb` with `ALTER USER 'k3s'@'192.168.99.21' IDENTIFIED BY '<DB_PASS>';` and the same for `.22`. 2) Each server: `OLD=$(sudo sed 's/.*::server://' /var/lib/rancher/k3s/server/token)`, put `$OLD` into `token:` in `/etc/rancher/k3s/config.yaml` and into `K3S_TOKEN=` in `~/k3s-secrets.env`, then `sudo systemctl restart k3s`. 3) Put the same token into each agent's `config.yaml` and `~/k3s-agent.env`, and into `k3s-db`'s two files, then `sudo systemctl restart k3s-agent` on the agents |
 | `kubectl` on a server: *The connection to the server 127.0.0.1:6443 was refused*; `systemctl status k3s` shows *activating (auto-restart)*; `journalctl -u k3s` shows *Error 1045 … Access denied for user 'k3s'* or *bootstrap data already found and encrypted with different token* | The server's `config.yaml` no longer matches the cluster. Usually Step 7 made new secrets after Step 9, and a later run of the Step 9/10 block wrote them into `config.yaml` and restarted K3s. It now restarts every few seconds, so the load climbs past 20 and SSH over `192.168.99.x` can stall | Get in through the NAT port (`ssh -p 22021 kali@127.0.0.1`), run `sudo systemctl stop k3s` to calm the VM down, then follow the fix in the row above |
 | Argo CD **HA** pods Pending | the HA manifest needs 3 schedulable nodes | Use 3 agents, or the non-HA `install.yaml` |
 | Browser shows `ERR_TOO_MANY_REDIRECTS` on argocd.home.lab | `server.insecure` not applied | Repeat Step 15 part 1 (patch + rollout restart) |
 | `argocd login` hangs, or shows *transport is closing* | gRPC through the ingress | Add `--grpc-web` |
+| Every `argocd` command fails with *Failed to establish connection to port-forward:443 … lookup port-forward: no such host* | The CLI was logged in with `--port-forward` (usually because `argocd.home.lab` didn't resolve yet). It saved a server named `port-forward`, which only works with `--port-forward` on every command | Add the Step 15 `/etc/hosts` line, then `argocd login argocd.home.lab --username admin --grpc-web --insecure`. `argocd context` must then show `*` at `argocd.home.lab`; `argocd context port-forward --delete` removes the old entry |
+| The podinfo app shows *Sync failed* with *spec.selector … field is immutable* | It was the Kustomize podinfo of an earlier version of Step 17; the Helm chart's Deployment selects its pods by other labels | `argocd app delete podinfo --yes`, wait until `kubectl -n podinfo get deploy` is empty, then apply Step 17 again |
 | `404 page not found` (from Traefik) | hosts entry or Ingress host mismatch, or you used `http://` | Check the hosts file and `kubectl get ingress -A`; use `https://` |
 | `sudo: set-identity: command not found` on a clone | Kali's `sudo` doesn't search `/usr/local/sbin` (Step 4 part 3 item 1 adds it), the template was cloned before part 3 finished, or a `sudo` password prompt swallowed part of the paste | On that clone, `sudo /usr/local/sbin/set-identity <name> <ip>` works if the file exists. Otherwise follow *Already cloned…* at the end of Step 4: delete the clones, fix the template, run the part 4 check, clone again |
 | `set-identity <name> <ip>` only prints its usage line, or `[[: not found` | `#!/usr/bin/env bash` is not the script's first line (an empty line from the paste), so `sh` runs it | On the template, or on each clone before its `set-identity`: `sudo sed -i -e 's/\r$//' -e '/./,$!d' /usr/local/sbin/set-identity`, then run the line again |
@@ -2243,7 +2406,9 @@ To test, power off `k3s-lb-1` (`VBoxManage controlvm k3s-lb-1 poweroff`). The VI
 | A clone's port forward doesn't answer, or `VBoxManage startvm` reports *Locked* / port forward errors in Step 5 | the clone was running while Step 5 changed its rule, or another program uses that host port | Power the clone off, then `VBoxManage modifyvm VMNAME --natpf1 delete ssh; VBoxManage modifyvm VMNAME --natpf1 "ssh,tcp,127.0.0.1,PORT,,22"`. `lsof -nP -iTCP:PORT -sTCP:LISTEN` shows which program holds a port |
 | A VM has no `192.168.99.x` after `set-identity` | NetworkManager ignored the keyfile, or NIC 2 is not attached | Get in with copy and paste through its NAT port forward: `ssh -p PORT kali@127.0.0.1` (Step 5 table, e.g. `22021` for `k3s-srv-1`). Then `nmcli connection show`; the files in `/etc/NetworkManager/system-connections/` must be owned by `root` with mode `600`; `sudo nmcli connection up hostonly`. On the Mac, `VBoxManage showvminfo VMNAME --machinereadable \| grep -E '^(nic2\|hostonly-network2)='` must print `nic2="hostonlynetwork"` and `hostonly-network2="k3s-hostonly"` |
 | The Mac gets slow, the VMs stutter, *Activity Monitor → Memory Pressure* is yellow or red | 8 running VMs × 2 GB is all the RAM of a 16 GB Mac | Power `kali` off when you don't use it. Boot nodes whose window you don't need without their desktop: `sudo systemctl set-default multi-user.target && sudo reboot` (back with `graphical.target`). Run two agents. Less RAM per VM also works, but leaves the same-spec plan: `VBoxManage modifyvm VMNAME --memory MB` while that VM is off |
-| Errors after the Mac slept (TLS *not yet valid*, DB timeouts) | The VMs were paused, and their clocks lag behind | `sudo systemctl restart systemd-timesyncd; timedatectl` on each VM, or restart the lab (Step 19) |
+| Every VM shows **Aborted** in the VirtualBox window | The Mac restarted or shut down while the VMs ran. macOS doesn't wait for them, and this includes the restart Software Update does after you log out. The VMs lost power | Run the START block of Step 19, then its check. MariaDB and K3s recover by themselves. Next time, run the STOP block first |
+| The VMs' clocks are seconds apart or behind the Mac; `timedatectl` shows *NTP service: inactive*; errors after the Mac slept (TLS *not yet valid*, DB timeouts) | The Guest Additions' `vboxadd-service` stops `systemd-timesyncd` (`Conflicts=`). Their own `VBoxService` then keeps the clock, but by default it only steps it when it is **20 minutes** off | On the Mac, for each VM: `VBoxManage guestproperty set VMNAME "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold" 1000` and the same with `--timesync-set-start` and value `1` (Step 3). Then in each VM: `sudo systemctl disable systemd-timesyncd; sudo systemctl restart vboxadd-service`. Check, on the Mac: `for v in $K3S_NODES; do printf '%-12s %s  Mac %s\n' ${v%% *} "$(ssh -n ${v%% *} date -u +%T)" "$(date -u +%T)"; done` shows the same UTC time twice on every line |
+| `https://argocd.home.lab` (or `podinfo`, `whoami`): *Could not resolve host* in curl, *server not found* in the browser, while `curl --resolve argocd.home.lab:443:192.168.99.10 -sk https://argocd.home.lab` works | The Mac's `/etc/hosts` has no `home.lab` line | Run the `/etc/hosts` block of Step 15 (and of Step 17 for `podinfo.home.lab`), which asks for your Mac password, and flush the DNS cache as shown there |
 | `kubectl` on `kali` → *connection refused* to `127.0.0.1:6443` | the raw `k3s.yaml` was copied instead of the Step 12 kubeconfig | Re-run the `scp ~/.kube/config kali:.kube/config` line from E.4 |
 | A VM (the template, a clone or `kali`) boots to a **text login**, no desktop | **Xfce** was not ticked in Software selection (ticking only the *Desktop environment* heading does nothing), or the VM was switched to `multi-user.target` (0.2) | `sudo apt update && sudo apt install -y kali-desktop-xfce` (what the Xfce entry installs), or `sudo tasksel` and tick Xfce; then `sudo systemctl set-default graphical.target && sudo reboot`. On the template, do it before Step 5, so the clones inherit it |
 | A VM window doesn't resize with its desktop, or the shared clipboard doesn't work | **Apple Silicon:** the VirtualBox Guest Additions are missing (template: Step 4 part 3b, inherited by the clones; `kali`: E.3). Kali has no arm64 `virtualbox-guest-x11` package. **Intel Mac:** `virtualbox-guest-x11` is missing | Apple Silicon: run the part 3b commands on the template before Step 5, or the E.3 commands (with that VM's name) on one VM. Then tick *View → Auto-resize Guest Display* in its window. Intel Mac: `sudo apt update && sudo apt install -y --reinstall virtualbox-guest-x11 && sudo reboot`. Both: `VBoxManage showvminfo VMNAME \| grep -i clipboard` must say *Bidirectional*; to turn it on, run `VBoxManage modifyvm VMNAME --clipboard-mode bidirectional` while the VM is off |
@@ -2347,6 +2512,8 @@ E.1 installs it on its own from the **same Kali ISO** as Step 3 (`Tools/iso`, ar
 > ```zsh
 > VBoxManage clonevm kali-template --name kali --register && VBoxManage modifyvm kali --groups "/k3s-ha"
 > VBoxManage modifyvm kali --natpf1 delete ssh; VBoxManage modifyvm kali --natpf1 "ssh,tcp,127.0.0.1,22050,,22"
+> VBoxManage guestproperty set kali "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold" 1000
+> VBoxManage guestproperty set kali "/VirtualBox/GuestAdd/VBoxService/--timesync-set-start" 1
 > VBoxManage startvm kali --type gui
 > ```
 >
@@ -2391,6 +2558,8 @@ E.1 installs it on its own from the **same Kali ISO** as Step 3 (`Tools/iso`, ar
   VBoxManage modifyvm $VM --clipboard-mode bidirectional --drag-and-drop bidirectional
   VBoxManage modifyvm $VM --nic1 nat --nic2 hostonlynet --host-only-net2 $HON
   VBoxManage modifyvm $VM --natpf1 "ssh,tcp,127.0.0.1,22050,,22"     # Mac 127.0.0.1:22050 -> kali port 22 (E.2)
+  VBoxManage guestproperty set $VM "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold" 1000   # on the Mac's clock (Step 3)
+  VBoxManage guestproperty set $VM "/VirtualBox/GuestAdd/VBoxService/--timesync-set-start" 1
   VBoxManage modifyvm $VM --boot1 disk --boot2 dvd --boot3 none --boot4 none
   VBoxManage createmedium disk --filename "$VDI" --size 25600 --format VDI     # 25 GB like every VM
   VBoxManage storagectl $VM --name $VBOX_CTL --portcount 2
@@ -2526,7 +2695,7 @@ sudo chmod 600 /etc/NetworkManager/system-connections/nat.nmconnection /etc/Netw
 sudo sed -i '/^# BEGIN home.lab/,/^# END home.lab/d' /etc/hosts
 sudo tee -a /etc/hosts >/dev/null <<'EOF'
 # BEGIN home.lab
-192.168.99.10  k3s-lb.home.lab k3s-lb k3s.home.lab argocd.home.lab whoami.home.lab
+192.168.99.10  k3s-lb.home.lab k3s-lb k3s.home.lab argocd.home.lab whoami.home.lab podinfo.home.lab
 192.168.99.11  k3s-db.home.lab k3s-db
 192.168.99.21  k3s-srv-1.home.lab k3s-srv-1
 192.168.99.22  k3s-srv-2.home.lab k3s-srv-2
@@ -2584,6 +2753,7 @@ VBoxManage storageattach kali --storagectl $VBOX_CTL --port 1 --device 0 --type 
 sudo mount -o ro /dev/sr0 /mnt
 sudo sh /mnt/VBoxLinuxAdditions-arm64.run
 sudo umount /mnt
+sudo systemctl disable --now systemd-timesyncd    # the Guest Additions keep the clock from now on (Step 4 part 3b)
 sudo reboot
 ```
 
@@ -2592,6 +2762,7 @@ After the reboot, check over SSH (`ssh kali`):
 ```bash
 lsmod | grep '^vbox'                    # vboxguest (and vboxsf)
 systemctl is-active vboxadd-service     # active
+sudo VBoxControl --nologo guestproperty get /VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold   # Value: 1000
 ```
 
 **In the `kali` window**, log in to the desktop.
@@ -2669,11 +2840,11 @@ argocd app list
 |---|---|---|
 | **Mac** | `~/Desktop/Working/Tools/`: `bin/kubectl`, `bin/argocd` (darwin-arm64), `iso/` (Kali arm64 installer), `downloads/` (VirtualBox `.dmg`), `k3s-lab.zsh`. VirtualBox in `/Applications/VirtualBox.app` (`VBoxManage` in `/usr/local/bin`), with the Step 2 networks: host-only network `k3s-hostonly` (Mac `192.168.99.100`, macOS DHCP `.101–.254`) and NAT network `NatNetwork`. OpenSSH and git from macOS | `~/.zshrc` (one line that loads `k3s-lab.zsh`: `Tools/bin` first on PATH, `interactivecomments`, `K3S_NODES`), `~/.kube/config`, `~/.ssh/config`, `~/.ssh/id_ed25519`, `/etc/hosts`, `~/Desktop/Working/homelab-gitops/` |
 | **kali-template** | Kali Linux arm64 with the **Xfce desktop** + LightDM, VirtualBox Guest Additions (Apple Silicon, Step 4 part 3b), NetworkManager, `set-identity`, `home.lab` hosts block, GRUB also on the EFI fallback path. 2 vCPU / 2 GB / 16 MB video / 25 GB, shared clipboard | `/usr/local/sbin/set-identity`, `/etc/sudoers.d/90-kali-nopasswd` + `91-secure-path`, `/etc/default/grub.d/90-eth-names.cfg`, `/boot/efi/EFI/BOOT/BOOTAA64.EFI`, `/etc/NetworkManager/conf.d/90-k3s.conf`, `~/.ssh/authorized_keys` (powered off, source of the 7 clones). VirtualBox NAT port forward `127.0.0.1:2222 → 22` (`ssh kali-template`) |
-| **every clone** (the 7 cluster VMs) | everything from the template (Xfce desktop, Guest Additions and the 2 vCPU / 2 GB / 16 MB / 25 GB specification included), plus its identity from `set-identity`, and its own NAT port forward `127.0.0.1:220xx → 22` (Step 5) | `/etc/hosts`, `/etc/NetworkManager/system-connections/{nat,hostonly}.nmconnection` |
+| **every clone** (the 7 cluster VMs) | everything from the template (Xfce desktop, Guest Additions and the 2 vCPU / 2 GB / 16 MB / 25 GB specification included), plus its identity from `set-identity`, and its own NAT port forward `127.0.0.1:220xx → 22` (Step 5). Clock: kept on the Mac's by `VBoxService` (guest properties `--timesync-set-threshold 1000` and `--timesync-set-start`, Steps 3 and 5); `systemd-timesyncd` disabled. Swap partition on, pods excluded from it | `/etc/hosts`, `/etc/NetworkManager/system-connections/{nat,hostonly}.nmconnection` |
 | **k3s-lb** | `nginx` + `libnginx-mod-stream` | `/etc/nginx/nginx.conf` |
 | **k3s-db** | `mariadb-server` (database `k3s`, user `k3s`) | `/etc/mysql/mariadb.conf.d/50-server.cnf` + `90-k3s.cnf`, `~/k3s-secrets.env`, `/etc/cron.d/k3s-db-backup` |
-| **k3s-srv-1/2** | `k3s` (server, tainted) | `/etc/rancher/k3s/config.yaml`, `/etc/rancher/k3s/k3s.yaml` |
-| **k3s-agent-1/2/3** | `k3s-agent`, plus pods: Traefik, svclb, Argo CD, apps | `/etc/rancher/k3s/config.yaml` |
+| **k3s-srv-1/2** | `k3s` (server, tainted), plus pods: one CoreDNS each (2 replicas, Step 11), metrics-server, local-path-provisioner, svclb | `/etc/rancher/k3s/config.yaml`, `/etc/rancher/k3s/k3s.yaml`. In the cluster: `HelmChartConfig` `kube-system/traefik` (Step 11) |
+| **k3s-agent-1/2/3** | `k3s-agent`, plus pods: Traefik (2 replicas on 2 agents, Step 11), svclb, Argo CD, `whoami` (Step 18), `podinfo` + `podinfo-redis` (Step 17), apps | `/etc/rancher/k3s/config.yaml` |
 | **kali** | its own Kali install with a **GUI**: Xfce desktop + LightDM (Software selection), VirtualBox Guest Additions (E.3, Apple Silicon) or `virtualbox-guest-x11` (Intel), OpenSSH server, Firefox ESR, `kubectl`, `argocd`. NAT port forward `127.0.0.1:22050 → 22` | `/etc/NetworkManager/system-connections/{nat,hostonly}.nmconnection`, `/etc/default/grub.d/90-eth-names.cfg`, `/etc/hosts`, `~/.kube/config`, `~/.ssh/config`, `~/.ssh/id_ed25519` |
 
 ---
@@ -2688,6 +2859,12 @@ argocd app list
 - K3s docs: Configuration file — <https://docs.k3s.io/installation/configuration>
 - Argo CD: Getting Started — <https://argo-cd.readthedocs.io/en/stable/getting_started/>
 - Argo CD: Ingress configuration (Traefik) — <https://argo-cd.readthedocs.io/en/stable/operator-manual/ingress/>
+- Argo CD: Helm (charts from a Git repo, `valuesObject`) — <https://argo-cd.readthedocs.io/en/stable/user-guide/helm/>
+- Argo CD: App deletion (the resources finalizer) — <https://argo-cd.readthedocs.io/en/stable/user-guide/app_deletion/>
+- K3s docs: Helm, *Customizing Packaged Components with HelmChartConfig* (Traefik, Step 11) — <https://docs.k3s.io/add-ons/helm>
+- Kubernetes docs: Swap memory management (`NoSwap`) — <https://kubernetes.io/docs/concepts/cluster-administration/swap-memory-management/>
+- systemd-gpt-auto-generator (activates GPT swap partitions; `systemd.swap=`) — <https://www.freedesktop.org/software/systemd/man/latest/systemd-gpt-auto-generator.html>
+- VirtualBox manual: *Tuning the Guest Additions Time Synchronization Parameters* (`--timesync-set-threshold`, `--timesync-set-start`) — <https://www.virtualbox.org/manual/topics/AdvancedTopics.html>
 - VirtualBox manual: VBoxManage — <https://www.virtualbox.org/manual/>
 - VirtualBox manual: host-only networking (host-only networks on macOS) — <https://www.virtualbox.org/manual/topics/networkingdetails.html>
 - VirtualBox 7.1 changelog (macOS / Arm64 hosts supported) — <https://www.virtualbox.org/wiki/Changelog-7.1>
@@ -2703,5 +2880,5 @@ argocd app list
 - Kali's `tasksel` (the installer's Software selection entries, `kali-tasks/`) — <https://gitlab.com/kalilinux/packages/tasksel>
 - Kubernetes docs: Install kubectl on Linux — <https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/>
 - Argo CD: CLI installation — <https://argo-cd.readthedocs.io/en/stable/cli_installation/>
-- podinfo (multi-arch demo app, `kustomize/`) — <https://github.com/stefanprodan/podinfo>
+- podinfo (multi-arch demo app) and its Helm chart, `charts/podinfo` (Step 17) — <https://github.com/stefanprodan/podinfo/tree/master/charts/podinfo>
 - Argo CD example apps (guestbook; its image is amd64-only) — <https://github.com/argoproj/argocd-example-apps>
